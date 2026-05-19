@@ -421,6 +421,9 @@ private:
             case 0b000101:
                 op_bne(instruction);
                 break;
+            case 0b000100:
+                op_beq(instruction);
+                break;
             default:
                 op_unknown(instruction);
         }
@@ -714,7 +717,16 @@ private:
         load = {t, static_cast<uint32_t>(v)};
     }
 
-    uint8_t load8(const uint32_t address) {
+    void op_beq(const Instruction instruction) {
+        const auto imm = instruction.imm_se();
+        const auto s = instruction.s();
+
+        if (const auto t = instruction.t(); reg(s) == reg(t)) {
+            branch(imm);
+        }
+    }
+
+    [[nodiscard]] uint8_t load8(const uint32_t address) const {
         return interconnect.load8(address);
     }
 
