@@ -149,6 +149,10 @@ public:
         data.assign(RAM_SIZE, 0xca);
     }
 
+    [[nodiscard]] constexpr uint8_t load8(const uint32_t offset) const {
+        return data[static_cast<size_t>(offset)];
+    }
+
     // Fetch a 32-bit little-endian word from a given RAM offset
     [[nodiscard]] constexpr uint32_t load32(const uint32_t offset) const {
         const auto idx = static_cast<size_t>(offset);
@@ -160,6 +164,10 @@ public:
 
         // Reconstruct the 32-bit word
         return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    }
+
+    void store8(const uint32_t offset, const uint8_t val) {
+        data[static_cast<size_t>(offset)] = val;
     }
 
     // Store a 32-bit little-endian word into a given RAM offset
@@ -203,6 +211,7 @@ namespace map {
     inline constexpr Range SYS_CONTROL = {0x1f801000, 36}; // Memory Control
     inline constexpr Range RAM_SIZE = {0x1f801060, 4}; // RAM Configuration
     inline constexpr Range SPU = {0x1f801c00, 640}; // SPU Registers
+    inline constexpr Range EXPANSION_1 = {0x1f000000, 512 * 1024}; // Expansion region 1
     inline constexpr Range EXPANSION_2 = {0x1f802000, 66}; // Expansion region 2
 
     // CACHE_CONTROL sits in KSEG2 space directly, bypasses masking targets
@@ -225,6 +234,15 @@ public:
         if (map::BIOS.contains(physical_address)) {
             const uint32_t offset = physical_address - map::BIOS.start;
             return bios.load8(offset);
+        }
+
+        if (map::RAM.contains(physical_address)) {
+            const uint32_t offset = physical_address - map::RAM.start;
+            return ram.load8(offset);
+        }
+
+        if (map::EXPANSION_1.contains(physical_address)) {
+            return 0xff;
         }
 
         throw std::runtime_error(std::format(
@@ -264,12 +282,17 @@ public:
         ));
     }
 
-    static void store8(const uint32_t virtual_address, const uint8_t val) {
+    void store8(const uint32_t virtual_address, const uint8_t val) {
         const auto physical_address = map::mask_region(virtual_address);
 
         if (map::EXPANSION_2.contains(physical_address)) {
             std::clog << "Unhandled write to EXPANSION_2 register\n";
             return;
+        }
+
+        if (map::RAM.contains(physical_address)) {
+            const uint32_t offset = physical_address - map::RAM.start;
+            return ram.store8(offset, val);
         }
 
         throw std::runtime_error(std::format(
@@ -684,7 +707,7 @@ private:
         set_reg(t, v);
     }
 
-    void op_sb(const Instruction instruction) const {
+    void op_sb(const Instruction instruction) {
         if ((sr & 0x10000) != 0) {
             std::clog << "Ignoring store while cache is isolated" << std::endl;
             return;
@@ -734,8 +757,8 @@ private:
         return interconnect.load32(address);
     }
 
-    static void store8(const uint32_t address, const uint8_t value) {
-        Interconnect::store8(address, value);
+    void store8(const uint32_t address, const uint8_t value) {
+        interconnect.store8(address, value);
     }
 
     static void store16(const uint32_t address, const uint16_t value) {
