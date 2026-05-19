@@ -443,6 +443,9 @@ private:
             case 0b100011:
                 op_lw(instruction);
                 break;
+            case 0b100100:
+                op_lbu(instruction);
+                break;
             case 0b101001:
                 op_sh(instruction);
                 break;
@@ -469,6 +472,9 @@ private:
                 break;
             case 0b000111:
                 op_bgtz(instruction);
+                break;
+            case 0b000110:
+                op_blez(instruction);
                 break;
             default:
                 op_unknown(instruction);
@@ -838,6 +844,29 @@ private:
         if (v > 0) {
             branch(imm);
         }
+    }
+
+    void op_blez(const Instruction instruction) {
+        const auto imm = instruction.imm_se();
+        const auto s = instruction.s();
+
+        const auto v = static_cast<int32_t>(reg(s));
+
+        if (v <= 0) {
+            branch(imm);
+        }
+    }
+
+    // Load Byte Unsigned
+    void op_lbu(const Instruction instruction) {
+        const auto i = instruction.imm_se();
+        const auto t = instruction.t();
+        const auto s = instruction.s();
+
+        const auto addr = reg(s) + i;
+        const auto v = load8(addr);
+
+        load = {t, static_cast<uint32_t>(v)};
     }
 
     [[nodiscard]] uint8_t load8(const uint32_t address) const {
