@@ -221,6 +221,7 @@ namespace map {
     inline constexpr Range EXPANSION_1 = {0x1f000000, 512 * 1024}; // Expansion region 1
     inline constexpr Range EXPANSION_2 = {0x1f802000, 66}; // Expansion region 2
     inline constexpr Range IRQ_CONTROL = {0x1f801070, 8};
+    inline constexpr Range TIMERS = {0x1f801100, 0x30};
 
     // CACHE_CONTROL sits in KSEG2 space directly, bypasses masking targets
     inline constexpr Range CACHE_CONTROL = {0xfffe0130, 4};
@@ -284,6 +285,12 @@ public:
             return 0;
         }
 
+        if (map::IRQ_CONTROL.contains(physical_address)) {
+            const uint32_t offset = physical_address - map::IRQ_CONTROL.start;
+            std::clog << std::format("IRQ_CONTROL read: {:x}", offset) << std::endl;
+            return 0;
+        }
+
         throw std::runtime_error(std::format(
             "Unhandled load32 read address: virtual {:08x} (physical {:08x})",
             virtual_address, physical_address
@@ -324,6 +331,11 @@ public:
         if (map::RAM.contains(physical_address)) {
             const uint32_t offset = physical_address - map::RAM.start;
             ram.store16(offset, val);
+            return;
+        }
+
+        if (map::TIMERS.contains(physical_address)) {
+            std::clog << "Unhandled write to TIMERS register" << std::endl;
             return;
         }
 
@@ -409,6 +421,12 @@ private:
     // They contain the output of the current instruction
     std::array<uint32_t, 32> output_registers{};
 
+    // HI register for division remainder and multiplication high result
+    uint32_t hi;
+
+    // LO register for division quotient and multiplication low result
+    uint32_t lo;
+
     // Load initiated by the current instructions
     struct LoadTarget {
         RegisterIndex reg;
@@ -439,6 +457,9 @@ private:
                 break;
             case 0b101011:
                 op_sw(instruction);
+                break;
+            case 0b001010:
+                op_slti(instruction);
                 break;
             case 0b100011:
                 op_lw(instruction);
@@ -476,6 +497,12 @@ private:
             case 0b000110:
                 op_blez(instruction);
                 break;
+            case 0b000001:
+                op_bxx(instruction);
+                break;
+            case 0b001011:
+                op_sltiu(instruction);
+                break;
             default:
                 op_unknown(instruction);
         }
@@ -495,6 +522,9 @@ private:
             case 0b101011:
                 op_sltu(instruction);
                 break;
+            case 0b101010:
+                op_slt(instruction);
+                break;
             case 0b100001:
                 op_addu(instruction);
                 break;
@@ -503,6 +533,30 @@ private:
                 break;
             case 0b001000:
                 op_jr(instruction);
+                break;
+            case 0b001001:
+                op_jalr(instruction);
+                break;
+            case 0b100011:
+                op_subu(instruction);
+                break;
+            case 0b000011:
+                op_sra(instruction);
+                break;
+            case 0b000010:
+                op_srl(instruction);
+                break;
+            case 0b011010:
+                op_div(instruction);
+                break;
+            case 0b011011:
+                op_divu(instruction);
+                break;
+            case 0b010010:
+                op_mflo(instruction);
+                break;
+            case 0b010000:
+                op_mfhi(instruction);
                 break;
             default:
                 op_unknown(instruction);
@@ -803,7 +857,7 @@ private:
                 throw std::runtime_error(std::format("Unhandled read from cop0 register: cop0r{}", cop_r.raw()));
         }
 
-        load = {cpu_r , v};
+        load = {cpu_r, v};
     }
 
     void op_and(const Instruction instruction) {
@@ -869,6 +923,165 @@ private:
         load = {t, static_cast<uint32_t>(v)};
     }
 
+    void op_jalr(const Instruction instruction) {
+        const auto d = instruction.d();
+        const auto s = instruction.s();
+
+        const auto ra = pc;
+
+        set_reg(d, ra);
+
+        pc = reg(s);
+    }
+
+    void op_bxx(const Instruction instruction) {
+        const auto imm = instruction.imm_se();
+        const auto s = instruction.s();
+
+        const auto raw_instruction = instruction.raw();
+
+        // Fetch bit 16 to determine if the check is "Greater than or equal to zero" (BGEZ)
+        const uint32_t is_bgez = (raw_instruction >> 16) & 1;
+
+        // Fetch bit 20 to determine if the branch should link a return address (AL variants)
+        const auto is_link = ((raw_instruction >> 20) & 1) != 0;
+
+        const auto v = static_cast<int32_t>(reg(s));
+
+        // Default to testing if the register value is less than zero (BLTZ)
+        uint32_t test = (v < 0) ? 1 : 0;
+
+        // XOR flip trick
+        // If it's a BGEZ opcode (is_bgez is 1), flip the test result
+        // (test < 0) XOR 1 is exactly equivalent to checking (test >= 0)
+        test = test ^ is_bgez;
+
+        if (test != 0) {
+            if (is_link) {
+                // Link the upcoming PC into the return address register ($ra / r31)
+                const auto ra = pc;
+                set_reg(RegisterIndex(31), ra);
+            }
+
+            branch(imm);
+        }
+    }
+
+    void op_slti(const Instruction instruction) {
+        const auto i = static_cast<int32_t>(instruction.imm_se());
+        const auto s = instruction.s();
+        const auto t = instruction.t();
+
+        const auto v = static_cast<int32_t>(reg(s)) < i;
+
+        set_reg(t, static_cast<uint32_t>(v));
+    }
+
+    void op_subu(const Instruction instruction) {
+        const auto s = instruction.s();
+        const auto t = instruction.t();
+        const auto d = instruction.d();
+
+        const auto v = reg(s) - reg(t);
+
+        set_reg(d, v);
+    }
+
+    void op_sra(const Instruction instruction) {
+        const auto i = instruction.shift();
+        const auto t = instruction.t();
+        const auto d = instruction.d();
+
+        const auto v = static_cast<int32_t>(reg(t)) >> i;
+
+        set_reg(d, static_cast<uint32_t>(v));
+    }
+
+    void op_div(const Instruction instruction) {
+        const auto s = instruction.s();
+        const auto t = instruction.t();
+
+        const auto n = static_cast<int32_t>(reg(s));
+        const auto d = static_cast<int32_t>(reg(t));
+
+        if (d == 0) {
+            // Division by zero, results are bogus
+            hi = static_cast<uint32_t>(n);
+
+            if (n >= 0) {
+                lo = 0xffffffff;
+            } else {
+                lo = 1;
+            }
+        } else if (static_cast<uint32_t>(n) == 0x80000000 && d == -1) {
+            // Result is not representable in a 32bit signed integer
+            hi = 0;
+            lo = 0x80000000;
+        } else {
+            hi = static_cast<uint32_t>(n % d);
+            lo = static_cast<uint32_t>(n / d);
+        }
+    }
+
+    void op_mflo(const Instruction instruction) {
+        const auto d = instruction.d();
+
+        set_reg(d, lo);
+    }
+
+    void op_srl(const Instruction instruction) {
+        const auto i = instruction.shift();
+        const auto t = instruction.t();
+        const auto d = instruction.d();
+
+        const auto v = reg(t) >> i;
+
+        set_reg(d, v);
+    }
+
+    void op_sltiu(const Instruction instruction) {
+        const auto i = instruction.imm_se();
+        const auto s = instruction.s();
+        const auto t = instruction.t();
+
+        const auto v = reg(s) < i;
+
+        set_reg(t, v);
+    }
+
+    void op_divu(const Instruction instruction) {
+        const auto s = instruction.s();
+        const auto t = instruction.t();
+
+        const auto n = reg(s);
+        const auto d = reg(t);
+
+        if (d == 0) {
+            // Division by zero, results are bogus
+            hi = n;
+            lo = 0xffffffff;
+        } else {
+            hi = n % d;
+            lo = n / d;
+        }
+    }
+
+    void op_mfhi(const Instruction instruction) {
+        const auto d = instruction.d();
+
+        set_reg(d, hi);
+    }
+
+    void op_slt(const Instruction instruction) {
+        const auto d = instruction.d();
+        const auto s = instruction.s();
+        const auto t = instruction.t();
+
+        const auto v = static_cast<int32_t>(reg(s)) < static_cast<int32_t>(reg(t));
+
+        set_reg(d, v);
+    }
+
     [[nodiscard]] uint8_t load8(const uint32_t address) const {
         return interconnect.load8(address);
     }
@@ -902,7 +1115,8 @@ private:
 
 public:
     explicit CPU(Interconnect interconnect) : pc(0xbfc00000), next_instruction(0x0),
-                                              interconnect(std::move(interconnect)), sr(0), load{RegisterIndex(0), 0} {
+                                              interconnect(std::move(interconnect)), sr(0), load{RegisterIndex(0), 0},
+                                              hi(0xdeadbeef), lo(0xdeadbeef) {
         registers.fill(0xdeadbeef);
         registers[0] = 0;
         output_registers.fill(0xdeadbeef);
