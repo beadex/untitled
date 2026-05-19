@@ -72,7 +72,7 @@ public:
         return opcode & 0xffff;
     }
 
-    // Return immediate value in bits [16:0] as a sign-extended 32 bit value
+    // Return immediate value in bits [16:0] as a sign-extended 32-bits value
     [[nodiscard]] constexpr uint32_t imm_se() const {
         const auto v = static_cast<int16_t>(opcode & 0xffff);
 
@@ -84,8 +84,8 @@ public:
     }
 
     // Coprocessor opcode
-    // This method returns the same bit range as Instruction::s
-    // however it returns it as a plain u32 instead of a RegisterIndex
+    // This method returns the same bit range as Instruction::s;
+    // however, it returns it as a plain u32 instead of a RegisterIndex
     // since it's not a register in this case
     [[nodiscard]] constexpr uint32_t cop_opcode() const {
         return (opcode >> 21) & 0x1f;
@@ -399,14 +399,28 @@ public:
     }
 };
 
+enum Exception {
+    SysCall = 0x8,
+};
+
 // --- CPU DEFINITION ---
 class CPU {
 private:
-    // The program counter register
+    // The program counter register: points to the next instruction
     uint32_t pc;
 
-    // Next instruction to be executed, used to simulate the branch delay slot
-    Instruction next_instruction;
+    // Next value for the PC, used to simulate the branch delay slot
+    uint32_t next_pc;
+
+    // Address of the instruction currently being executed.
+    // Used for setting the EPC in exceptions.
+    uint32_t current_pc;
+
+    // Cop0 register 13: Cause Register
+    uint32_t cause;
+
+    // Cop0 register 14: EPC
+    uint32_t epc;
 
     // General purpose registers. the first must always contain 0.
     std::array<uint32_t, 32> registers{};
@@ -558,6 +572,9 @@ private:
             case 0b010000:
                 op_mfhi(instruction);
                 break;
+            case 0b001100:
+                op_syscall(instruction);
+                break;
             default:
                 op_unknown(instruction);
         }
@@ -575,7 +592,7 @@ private:
         const auto imm = instruction.imm();
         const auto t = instruction.t();
 
-        // Low 16bits are set to 0
+        // Low 16 bits are set to 0
         const auto v = imm << 16;
 
         set_reg(t, v);
@@ -631,7 +648,7 @@ private:
     void op_j(const Instruction instruction) {
         const auto imm = instruction.imm_jump();
 
-        pc = (pc & 0xf0000000) | (imm << 2);
+        next_pc = (pc & 0xf0000000) | (imm << 2);
     }
 
     void op_or(const Instruction instruction) {
@@ -689,15 +706,10 @@ private:
 
     void branch(const uint32_t offset) {
         // Offset immediate are always shifted two places to the right
-        // since PC addresses have to aligned on 32bits at all time
+        // since PC addresses have to align on 32 bits at all time
         const auto shifted_offset = offset << 2;
 
-        auto current_pc = pc;
-
-        current_pc += shifted_offset;
-        current_pc -= 4;
-
-        pc = current_pc;
+        next_pc = pc + shifted_offset;
     }
 
     void op_bne(const Instruction instruction) {
@@ -781,7 +793,7 @@ private:
     }
 
     void op_jal(const Instruction instruction) {
-        const auto ra = pc;
+        const auto ra = next_pc;
 
         set_reg(RegisterIndex(31), ra);
 
@@ -818,7 +830,7 @@ private:
     void op_jr(const Instruction instruction) {
         const auto s = instruction.s();
 
-        pc = reg(s);
+        next_pc = reg(s);
     }
 
     void op_lb(const Instruction instruction) {
@@ -852,7 +864,11 @@ private:
                 v = sr;
                 break;
             case 13:
-                throw std::runtime_error("Unhandled read from cop0 CAUSE register");
+                v = cause;
+                break;
+            case 14:
+                v = epc;
+                break;
             default:
                 throw std::runtime_error(std::format("Unhandled read from cop0 register: cop0r{}", cop_r.raw()));
         }
@@ -927,11 +943,12 @@ private:
         const auto d = instruction.d();
         const auto s = instruction.s();
 
-        const auto ra = pc;
+        const auto ra = next_pc;
 
         set_reg(d, ra);
 
         pc = reg(s);
+        next_pc = pc + 4;
     }
 
     void op_bxx(const Instruction instruction) {
@@ -1082,6 +1099,24 @@ private:
         set_reg(d, v);
     }
 
+    void exception(const Exception exc) {
+        const uint32_t handler = (sr & (1 << 22)) != 0 ? 0xbfc00180 : 0x80000080;
+
+        const uint32_t mode = sr & 0x3f;
+        sr &= ~0x3fu;
+        sr |= (mode << 2) & 0x3f;
+
+        cause = static_cast<uint32_t>(exc) << 2;
+
+        epc = current_pc;
+        pc = handler;
+        next_pc = pc + 4;
+    }
+
+    void op_syscall(const Instruction _) {
+        exception(Exception::SysCall);
+    }
+
     [[nodiscard]] uint8_t load8(const uint32_t address) const {
         return interconnect.load8(address);
     }
@@ -1114,9 +1149,12 @@ private:
     }
 
 public:
-    explicit CPU(Interconnect interconnect) : pc(0xbfc00000), next_instruction(0x0),
-                                              interconnect(std::move(interconnect)), sr(0), load{RegisterIndex(0), 0},
-                                              hi(0xdeadbeef), lo(0xdeadbeef) {
+    explicit CPU(Interconnect interconnect) : cause(0), epc(0), interconnect(std::move(interconnect)), sr(0),
+                                              hi(0xdeadbeef),
+                                              lo(0xdeadbeef), load{RegisterIndex(0), 0} {
+        pc = 0xbfc00000;
+        next_pc = pc + 4;
+        current_pc = pc;
         registers.fill(0xdeadbeef);
         registers[0] = 0;
         output_registers.fill(0xdeadbeef);
@@ -1125,29 +1163,29 @@ public:
 
     void run_next_instruction() {
         // 1. Capture the exact program counter matching the instruction we are about to execute
-        const auto current_pc = pc;
 
-        // 2. The instruction to execute right now is what was staged in the delay slot buffer
-        const auto instruction = next_instruction;
+        // 2. Fetch instruction at current PC
+        const auto instruction = Instruction(load32(pc));
 
-        // 3. Log the accurate execution state cleanly
-        std::clog << std::format("PC: 0x{:08x} | Opcode: 0x{:08x}\n", current_pc, instruction.raw());
+        // 3. Save the address of the current instruction to save in EPC in case of an exception
+        current_pc = pc;
 
-        // 4. Fetch the UPCOMING opcode from the updated current address to stage for the next loop
-        const auto raw_op = load32(current_pc);
-        next_instruction = Instruction(raw_op);
+        // 4. Log the accurate execution state cleanly
+        std::clog << std::format("PC: 0x{:08x} | Opcode: 0x{:08x}\n", pc, instruction.raw());
 
-        // 5. Advance the program counter for the next instruction cycle step
-        pc = current_pc + 4;
+        // 5. Increment next PC to point to the next instruction
+        pc = next_pc;
+        next_pc = next_pc + 4;
 
-        // 6. Handle your pending load delay slot commits before decoding the op
+        // 6. Execute the pending load (if any; otherwise it will load R0, which is a NOP)
+        // set_reg works only on output_registers so this operation won't be visible by the next instruction
         set_reg(load.reg, load.value);
+
         load = {RegisterIndex(0), 0};
 
-        // 7. Execute the current opcode
         decode_and_execute(instruction);
 
-        // 8. Safely commit register states
+        // 7. Copy the output registers to the main register set as input for the next instruction
         registers = output_registers;
     }
 };
