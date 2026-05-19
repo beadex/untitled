@@ -101,6 +101,10 @@ public:
     // Fixed size: 512KB
     static constexpr uint64_t BIOS_SIZE = 512 * 1024;
 
+    [[nodiscard]] uint8_t load8(const uint32_t offset) const {
+        return data[static_cast<size_t>(offset)];
+    }
+
     [[nodiscard]] uint32_t load32(const uint32_t offset) const {
         const auto idx = static_cast<size_t>(offset);
 
@@ -215,13 +219,27 @@ public:
     explicit Interconnect(BIOS bios) : bios(std::move(bios)), ram() {
     }
 
+    [[nodiscard]] uint8_t load8(const uint32_t virtual_address) const {
+        const auto physical_address = map::mask_region(virtual_address);
+
+        if (map::BIOS.contains(physical_address)) {
+            const uint32_t offset = physical_address - map::BIOS.start;
+            return bios.load8(offset);
+        }
+
+        throw std::runtime_error(std::format(
+            "Unhandled load8 read address: virtual {:08x} (physical {:08x})",
+            virtual_address, physical_address
+        ));
+    }
+
     [[nodiscard]] uint32_t load32(uint32_t virtual_address) const {
         if (virtual_address % 4 != 0) {
             throw std::runtime_error(std::format("Unaligned load32 address: {:08x}", virtual_address));
         }
 
         // Step 1: Clean address to physical mapping space
-        uint32_t physical_address = map::mask_region(virtual_address);
+        const auto physical_address = map::mask_region(virtual_address);
 
         // Step 2: Route using clean physical contains rules
         if (map::RAM.contains(physical_address)) {
@@ -247,7 +265,7 @@ public:
     }
 
     static void store8(const uint32_t virtual_address, const uint8_t val) {
-        const uint32_t physical_address = map::mask_region(virtual_address);
+        const auto physical_address = map::mask_region(virtual_address);
 
         if (map::EXPANSION_2.contains(physical_address)) {
             std::clog << "Unhandled write to EXPANSION_2 register\n";
@@ -265,7 +283,7 @@ public:
             throw std::runtime_error(std::format("Unaligned store16 address: {:08x}", virtual_address));
         }
 
-        const uint32_t physical_address = map::mask_region(virtual_address);
+        const auto physical_address = map::mask_region(virtual_address);
 
         if (map::SPU.contains(physical_address)) {
             std::clog << "Unhandled write to SPU register\n";
@@ -284,7 +302,7 @@ public:
         }
 
         // Apply masking on target write operations as well
-        const uint32_t physical_address = map::mask_region(virtual_address);
+        const auto physical_address = map::mask_region(virtual_address);
 
         if (map::RAM.contains(physical_address)) {
             const uint32_t offset = physical_address - map::RAM.start;
@@ -387,6 +405,9 @@ private:
                 break;
             case 0b101000:
                 op_sb(instruction);
+                break;
+            case 0b100000:
+                op_lb(instruction);
                 break;
             case 0b000010:
                 op_j(instruction);
@@ -682,6 +703,21 @@ private:
         pc = reg(s);
     }
 
+    void op_lb(const Instruction instruction) {
+        const auto imm = instruction.imm_se();
+        const auto t = instruction.t();
+        const auto s = instruction.s();
+
+        const auto addr = reg(s) + imm;
+        const auto v = static_cast<int8_t>(load8(addr));
+
+        load = {t, static_cast<uint32_t>(v)};
+    }
+
+    uint8_t load8(const uint32_t address) {
+        return interconnect.load8(address);
+    }
+
     [[nodiscard]] uint32_t load32(const uint32_t address) const {
         return interconnect.load32(address);
     }
@@ -719,26 +755,29 @@ public:
     }
 
     void run_next_instruction() {
-        const auto current_pc = pc;
-        // Fetch instruction at PC
+        // 1. The instruction to execute right now is the one staged previously
         const auto instruction = next_instruction;
-        const auto raw_op = load32(current_pc);
-        next_instruction = Instruction(raw_op);
 
-        pc = current_pc + 4;
+        // Log the EXACT PC that corresponds to this instruction
+        // Since the constructor advanced pc to 0xbfc00004, the instruction's actual PC is (pc - 4)
+        std::clog << std::format("PC: 0x{:08x} | Opcode: 0x{:08x}\n", pc - 4, instruction.raw());
 
-        std::clog << std::format("0x{:08x}", instruction.raw()) << std::endl;
+        // 2. Stage the NEXT instruction into the delay slot buffer from the current PC location
+        const auto raw_op = load32(pc);
+        next_instruction = Instruction(raw_op); //
 
-        // Execute the pending load if any
-        // otherwise it will load $zero which is a NOP
-        // set_reg works only on output_registers, so this operation won't be visible by the next instruction
-        set_reg(load.reg, load.value);
+        // 3. Advance PC for the next cycle loop
+        pc += 4;
 
-        load = {RegisterIndex(0), 0};
+        // 4. Handle pending load delay slot commits
+        set_reg(load.reg, load.value); //
+        load = {RegisterIndex(0), 0};  //
 
-        decode_and_execute(instruction);
+        // 5. Run the actual instruction
+        decode_and_execute(instruction); //
 
-        registers = output_registers;
+        // Commit register file mutations
+        registers = output_registers; //
     }
 };
 
