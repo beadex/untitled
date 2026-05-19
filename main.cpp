@@ -170,6 +170,13 @@ public:
         data[static_cast<size_t>(offset)] = val;
     }
 
+    void store16(const uint32_t offset, const uint16_t val) {
+        const auto idx = static_cast<size_t>(offset);
+
+        data[idx + 0] = static_cast<uint8_t>(val);
+        data[idx + 1] = static_cast<uint8_t>(val >> 8);
+    }
+
     // Store a 32-bit little-endian word into a given RAM offset
     void store32(const uint32_t offset, const uint32_t val) {
         const auto idx = static_cast<size_t>(offset);
@@ -213,6 +220,7 @@ namespace map {
     inline constexpr Range SPU = {0x1f801c00, 640}; // SPU Registers
     inline constexpr Range EXPANSION_1 = {0x1f000000, 512 * 1024}; // Expansion region 1
     inline constexpr Range EXPANSION_2 = {0x1f802000, 66}; // Expansion region 2
+    inline constexpr Range IRQ_CONTROL = {0x1f801070, 8};
 
     // CACHE_CONTROL sits in KSEG2 space directly, bypasses masking targets
     inline constexpr Range CACHE_CONTROL = {0xfffe0130, 4};
@@ -286,7 +294,7 @@ public:
         const auto physical_address = map::mask_region(virtual_address);
 
         if (map::EXPANSION_2.contains(physical_address)) {
-            std::clog << "Unhandled write to EXPANSION_2 register\n";
+            std::clog << "Unhandled write to EXPANSION_2 register" << std::endl;
             return;
         }
 
@@ -301,7 +309,7 @@ public:
         ));
     }
 
-    static void store16(const uint32_t virtual_address, const uint16_t val) {
+    void store16(const uint32_t virtual_address, const uint16_t val) {
         if (virtual_address % 2 != 0) {
             throw std::runtime_error(std::format("Unaligned store16 address: {:08x}", virtual_address));
         }
@@ -309,7 +317,13 @@ public:
         const auto physical_address = map::mask_region(virtual_address);
 
         if (map::SPU.contains(physical_address)) {
-            std::clog << "Unhandled write to SPU register\n";
+            std::clog << "Unhandled write to SPU register" << std::endl;
+            return;
+        }
+
+        if (map::RAM.contains(physical_address)) {
+            const uint32_t offset = physical_address - map::RAM.start;
+            ram.store16(offset, val);
             return;
         }
 
@@ -344,19 +358,25 @@ public:
                         throw std::runtime_error(std::format("Bad expansion 2 base address: 0x{:08x}", value));
                     }
                 default:
-                    std::clog << "Unhandled write to MEM_CONTROL register\n";
+                    std::clog << "Unhandled write to MEM_CONTROL register" << std::endl;
                     break;
             }
             return;
         }
 
         if (map::RAM_SIZE.contains(physical_address)) {
-            std::clog << "Unhandled write to RAM_SIZE register\n";
+            std::clog << "Unhandled write to RAM_SIZE register" << std::endl;
             return;
         }
 
         if (map::CACHE_CONTROL.contains(physical_address)) {
-            std::clog << "Unhandled write to CACHE_CONTROL register\n";
+            std::clog << "Unhandled write to CACHE_CONTROL register" << std::endl;
+            return;
+        }
+
+        if (map::IRQ_CONTROL.contains(physical_address)) {
+            const uint32_t offset = physical_address - map::IRQ_CONTROL.start;
+            std::clog << std::format("IRQ_CONTROL: {:x} <- 0x{:08x}", offset, value) << std::endl;
             return;
         }
 
@@ -447,6 +467,9 @@ private:
             case 0b000100:
                 op_beq(instruction);
                 break;
+            case 0b000111:
+                op_bgtz(instruction);
+                break;
             default:
                 op_unknown(instruction);
         }
@@ -457,6 +480,9 @@ private:
             case 0b000000:
                 op_sll(instruction);
                 break;
+            case 0b100100:
+                op_and(instruction);
+                break;
             case 0b100101:
                 op_or(instruction);
                 break;
@@ -465,6 +491,9 @@ private:
                 break;
             case 0b100001:
                 op_addu(instruction);
+                break;
+            case 0b100000:
+                op_add(instruction);
                 break;
             case 0b001000:
                 op_jr(instruction);
@@ -630,7 +659,7 @@ private:
 
         // If imm > 0, s_val cannot be greater than INT32_MAX -i
         // If imm < 0, s_val cannot be less than INT32_MIN - i
-        if ((imm > 0 && s_val > INT32_MAX - imm) || (imm < 0 && s_val < INT32_MIN + imm)) {
+        if ((imm > 0 && s_val > INT32_MAX - imm) || (imm < 0 && s_val < INT32_MIN - imm)) {
             throw std::runtime_error("ADDI overflow");
         }
 
@@ -675,7 +704,7 @@ private:
         set_reg(d, v);
     }
 
-    void op_sh(const Instruction instruction) const {
+    void op_sh(const Instruction instruction) {
         if ((sr & 0x10000) != 0) {
             std::clog << "Ignoring store while cache is isolated" << std::endl;
             return;
@@ -771,6 +800,46 @@ private:
         load = {cpu_r , v};
     }
 
+    void op_and(const Instruction instruction) {
+        const auto d = instruction.d();
+        const auto s = instruction.s();
+        const auto t = instruction.t();
+
+        const auto v = reg(s) & reg(t);
+
+        set_reg(d, v);
+    }
+
+    void op_add(const Instruction instruction) {
+        const auto t = instruction.t();
+        const auto s = instruction.s();
+        const auto d = instruction.d();
+
+        const auto s_val = static_cast<int32_t>(reg(s));
+        const auto t_val = static_cast<int32_t>(reg(t));
+
+        // If imm > 0, s_val cannot be greater than INT32_MAX -i
+        // If imm < 0, s_val cannot be less than INT32_MIN - i
+        if ((t_val > 0 && s_val > INT32_MAX - t_val) || (t_val < 0 && s_val < INT32_MIN - t_val)) {
+            throw std::runtime_error("ADD overflow");
+        }
+
+        const int32_t result = s_val + t_val;
+
+        set_reg(d, static_cast<uint32_t>(result));
+    }
+
+    void op_bgtz(const Instruction instruction) {
+        const auto imm = instruction.imm_se();
+        const auto s = instruction.s();
+
+        const auto v = static_cast<int32_t>(reg(s));
+
+        if (v > 0) {
+            branch(imm);
+        }
+    }
+
     [[nodiscard]] uint8_t load8(const uint32_t address) const {
         return interconnect.load8(address);
     }
@@ -783,8 +852,8 @@ private:
         interconnect.store8(address, value);
     }
 
-    static void store16(const uint32_t address, const uint16_t value) {
-        Interconnect::store16(address, value);
+    void store16(const uint32_t address, const uint16_t value) {
+        interconnect.store16(address, value);
     }
 
     void store32(const uint32_t address, const uint32_t value) {
@@ -812,29 +881,31 @@ public:
     }
 
     void run_next_instruction() {
-        // 1. The instruction to execute right now is the one staged previously
+        // 1. Capture the exact program counter matching the instruction we are about to execute
+        const auto current_pc = pc;
+
+        // 2. The instruction to execute right now is what was staged in the delay slot buffer
         const auto instruction = next_instruction;
 
-        // Log the EXACT PC that corresponds to this instruction
-        // Since the constructor advanced pc to 0xbfc00004, the instruction's actual PC is (pc - 4)
-        std::clog << std::format("PC: 0x{:08x} | Opcode: 0x{:08x}\n", pc - 4, instruction.raw());
+        // 3. Log the accurate execution state cleanly
+        std::clog << std::format("PC: 0x{:08x} | Opcode: 0x{:08x}\n", current_pc, instruction.raw());
 
-        // 2. Stage the NEXT instruction into the delay slot buffer from the current PC location
-        const auto raw_op = load32(pc);
-        next_instruction = Instruction(raw_op); //
+        // 4. Fetch the UPCOMING opcode from the updated current address to stage for the next loop
+        const auto raw_op = load32(current_pc);
+        next_instruction = Instruction(raw_op);
 
-        // 3. Advance PC for the next cycle loop
-        pc += 4;
+        // 5. Advance the program counter for the next instruction cycle step
+        pc = current_pc + 4;
 
-        // 4. Handle pending load delay slot commits
-        set_reg(load.reg, load.value); //
-        load = {RegisterIndex(0), 0};  //
+        // 6. Handle your pending load delay slot commits before decoding the op
+        set_reg(load.reg, load.value);
+        load = {RegisterIndex(0), 0};
 
-        // 5. Run the actual instruction
-        decode_and_execute(instruction); //
+        // 7. Execute the current opcode
+        decode_and_execute(instruction);
 
-        // Commit register file mutations
-        registers = output_registers; //
+        // 8. Safely commit register states
+        registers = output_registers;
     }
 };
 
