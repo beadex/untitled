@@ -560,6 +560,9 @@ private:
             case 0b00100:
                 op_mtc0(instruction);
                 break;
+            case 0b00000:
+                op_mfc0(instruction);
+                break;
             default:
                 op_unknown(instruction);
         }
@@ -749,6 +752,25 @@ private:
         }
     }
 
+    void op_mfc0(const Instruction instruction) {
+        const auto cpu_r = instruction.t();
+        const auto cop_r = instruction.d();
+
+        uint32_t v = 0;
+
+        switch (cop_r.raw()) {
+            case 12:
+                v = sr;
+                break;
+            case 13:
+                throw std::runtime_error("Unhandled read from cop0 CAUSE register");
+            default:
+                throw std::runtime_error(std::format("Unhandled read from cop0 register: cop0r{}", cop_r.raw()));
+        }
+
+        load = {cpu_r , v};
+    }
+
     [[nodiscard]] uint8_t load8(const uint32_t address) const {
         return interconnect.load8(address);
     }
@@ -816,12 +838,19 @@ public:
     }
 };
 
-[[noreturn]] int main() {
-    const auto bios = BIOS::load_from_file("/home/beadex/Projects/scph1001.bin");
-    const auto interconnect = new Interconnect(bios);
-    const auto cpu = new CPU(*interconnect);
+int main() {
+    try {
+        const auto bios = BIOS::load_from_file("/home/beadex/Projects/scph1001.bin");
 
-    while (true) {
-        cpu->run_next_instruction();
+        // Pure value stack mechanics ensure single-ownership memory integrity
+        Interconnect interconnect(bios);
+        CPU cpu(std::move(interconnect));
+
+        while (true) {
+            cpu.run_next_instruction();
+        }
+    } catch (const std::exception &e) {
+        std::cerr << "Emulator crashed: " << e.what() << std::endl;
+        return 1;
     }
 }
